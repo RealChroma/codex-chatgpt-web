@@ -20,7 +20,7 @@ const DEFAULT_STATE = Object.freeze({
   composerPredictionsEnabled: true,
   experimentalSkillAttachments: false,
   experimentalFreshConversationPerTurn: false,
-  useSavedChats: false,
+  useSavedChats: true,
   zeroRiskProEnabled: false,
   codexWallpapersEnabled: false,
   codexWallpapersRestartRequired: false,
