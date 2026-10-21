@@ -29,6 +29,15 @@ Download and install the [latest RealChroma release](https://github.com/RealChro
 once to switch to the updated release source. Quit the launcher before running the installer.
 The existing ChatGPT browser profile and launcher settings are preserved.
 
+### Browser diagnostic retention
+
+Browser checkpoints are stored under `~/.codex-chatgpt-web/diagnostics/browser-turns/`.
+Failed captures are retained for up to three days within a 100 MB budget for finished captures.
+Newer failures take priority over older failures and the ten most recent successful captures.
+Active captures are never removed by cleanup. A burst of failures can exhaust the disk budget,
+so copy any specifically requested checkpoint files before continuing a long investigation.
+The safe-log export is separate and does not include these browser checkpoint files.
+
 ## Models do not appear, or setup remains on step 3
 
 **Install models** updates the Codex route, but a running Codex process keeps its old model catalog.
@@ -231,6 +240,13 @@ Browser-only mode needs no connector. Full harness mode requires all of the foll
 - the connector and Tunnel on the same OpenAI account as the ChatGPT workspace;
 - **Allow all actions** under the connector's permissions; and
 - **Connect harness** completed before **Verify runtime**.
+
+If a turn reports **ChatGPT is waiting for plugin permission**, open the plugin's settings
+in ChatGPT and choose **Permissions → Allow all actions**, then retry the turn. A visible
+**Allow ChatGPT to use …?** card means ChatGPT is waiting for a permission decision. If
+all actions are already allowed, open the ChatGPT tab and check the request; saved chats
+can still ask for one-time approval. Wait for the Stop button to disappear before approving.
+The launcher leaves unanswered requests untouched when the turn stops.
 
 If ChatGPT says **MCP endpoint not found**, keep the launcher running and complete
 **Connect harness** before creating the plugin. Use the same Tunnel ID in both places and

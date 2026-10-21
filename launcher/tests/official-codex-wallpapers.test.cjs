@@ -1465,6 +1465,105 @@ test("official wallpaper integration is unavailable outside Windows", async () =
 
 const { providerSptQuotaBreakpointSite, shouldRefreshWebQuotaComposer } = require("../electron/official-codex-wallpapers.cjs");
 const storeSptSource = 'function Spt(){let zt={settings:{model:"chatgpt-web/test"}},vn=X(bt===`local`&&ZP),abc=zt.settings.model;let Zn=De||gn||St||rt&&it||yt||Ot||nn&&Ht||on?.isLoading===!0||wt||vn;return Zn}';
+const { providerXhtQuotaBreakpointSite } = require("../electron/official-codex-wallpapers.cjs");
+const storeXhtSource = 'function Xht(e){let zt={settings:{model:"chatgpt-web/test"}},vn=Z(yt===`local`&&VP),abc=zt.settings.model;let Zn=Ae||gn||xt||rt&&it||vt||Dt||nn&&Ht||on?.isLoading===!0||Ct||vn,Qn;return Zn}';
+
+test("Store 26.1016 Xht matcher requires a unique native quota gate and model source", () => {
+  const site = providerXhtQuotaBreakpointSite(storeXhtSource);
+  assert.equal(site.found, true);
+  assert.equal(site.strategy, "xht-native-quota");
+  assert.equal(site.modelVariable, "zt.settings.model");
+  assert.equal(site.quotaVariable, "vn");
+  assert.equal(storeXhtSource.slice(site.candidateIndex, site.candidateIndex + 2), "Ae");
+  assert.equal(providerXhtQuotaBreakpointSite(storeXhtSource + storeXhtSource).reason, "xht-composer-ambiguous");
+  assert.equal(providerXhtQuotaBreakpointSite(storeXhtSource.replace("||Ct||vn", "||Ct||foo")).found, false);
+  assert.equal(providerXhtQuotaBreakpointSite(storeXhtSource.replace("zt.settings.model", "otherModel")).found, false);
+  assert.equal(providerXhtQuotaBreakpointSite(storeXhtSource.replace("vn=Z(yt===`local`&&VP)", "vn=false")).found, false);
+});
+
+test("Store Xht installer changes only native quota for authenticated Web model selection", async () => {
+  const site = providerXhtQuotaBreakpointSite(storeXhtSource);
+  const installed = [];
+  const calls = [];
+  class StoreXhtSocket extends FakeWebSocket {
+    send(raw) {
+      const message = JSON.parse(raw);
+      calls.push(message.method);
+      const reply = result => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ id: message.id, result }),
+      }));
+      const emit = (method, params) => queueMicrotask(() => this.onmessage?.({
+        data: JSON.stringify({ method, params }),
+      }));
+      if (message.method === "Debugger.disable") return reply({});
+      if (message.method === "Debugger.enable") {
+        emit("Debugger.scriptParsed", { scriptId: "xht_1", url: "app://-/assets/app-primary-98d23d806dbd.js" });
+        return reply({});
+      }
+      if (message.method === "Debugger.getScriptSource") return reply({ scriptSource: storeXhtSource });
+      if (message.method === "Debugger.getPossibleBreakpoints") return reply({ locations: [
+        { scriptId: "xht_1", ...site.candidate },
+      ] });
+      if (message.method === "Runtime.evaluate") return reply({ result: { value: false } });
+      if (message.method === "Debugger.setBreakpointByUrl") {
+        installed.push(message.params);
+        return reply({ breakpointId: "store_xht_1" });
+      }
+      throw new Error("unexpected CDP method " + message.method);
+    }
+  }
+  const contents = new CdpContents("ws://127.0.0.1:9333/devtools/page/test", StoreXhtSocket);
+  try {
+    const result = await installProviderAwareComposerQuotaPatch(contents);
+    assert.equal(result.applied, true);
+    assert.equal(result.strategy, "xht-native-quota");
+    assert.deepEqual(result.breakpointIds, ["store_xht_1"]);
+    assert.equal(installed.length, 1);
+    assert.ok(calls.includes("Debugger.getPossibleBreakpoints"));
+    assert.equal(calls.includes("Debugger.setScriptSource"), false);
+    for (const webSelected of [false, true]) {
+      for (const nativeBlocked of [false, true]) {
+        for (const modelSlug of ["chatgpt-web/gpt-6-sol", "gpt-6.1-sol", "unknown"]) {
+          const ctx = {
+            zt: { settings: { model: modelSlug } }, vn: true,
+            Ae: true, Ct: false,
+            __codexWebGptWebProviderSelected: webSelected,
+            __codexWebGptNativeQuotaBlocked: nativeBlocked,
+          };
+          assert.equal(vm.runInNewContext(installed[0].condition, ctx), false);
+          assert.equal(ctx.vn, !(webSelected && nativeBlocked && modelSlug.startsWith("chatgpt-web/")));
+          assert.equal(ctx.Ae, true);
+          assert.equal(ctx.Ct, false);
+          assert.equal(vm.runInNewContext("Ae||Ct||vn", ctx), true, "unrelated restrictions remain enforced");
+        }
+      }
+    }
+  } finally { contents.close(); }
+});
+
+test("Store Xht patch rejects missing safe breakpoint locations", async () => {
+  const site = providerXhtQuotaBreakpointSite(storeXhtSource);
+  const calls = [];
+  class ChangedXhtSocket extends FakeWebSocket {
+    send(raw) {
+      const message = JSON.parse(raw);
+      calls.push(message.method);
+      const reply = result => queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ id: message.id, result }) }));
+      const emit = (method, params) => queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ method, params }) }));
+      if (message.method === "Debugger.enable") emit("Debugger.scriptParsed", { scriptId: "xht_1", url: "app://-/assets/app-primary-98d23d806dbd.js" });
+      if (message.method === "Debugger.getScriptSource") return reply({ scriptSource: storeXhtSource });
+      if (message.method === "Debugger.getPossibleBreakpoints") return reply({ locations: [{ scriptId: "xht_1", lineNumber: site.submit.lineNumber + 1, columnNumber: 0 }] });
+      if (message.method === "Runtime.evaluate") return reply({ result: { value: false } });
+      return reply({});
+    }
+  }
+  const contents = new CdpContents("ws://127.0.0.1:9333/devtools/page/test", ChangedXhtSocket);
+  try {
+    const result = await installProviderAwareComposerQuotaPatch(contents);
+    assert.deepEqual(result, { applied: false, reason: "xht-native-quota-breakpoint-location-missing" });
+    assert.equal(calls.includes("Debugger.setBreakpointByUrl"), false);
+  } finally { contents.close(); }
+});
 
 test("Store 26.1013 Spt matcher requires a unique gate, native quota, and model source", () => {
   const site = providerSptQuotaBreakpointSite(storeSptSource);
@@ -1549,6 +1648,7 @@ test("Store Spt refresh only applies to a safe blocked Web send outside cooldown
     lastAttempt: 5000,
   };
   assert.equal(shouldRefreshWebQuotaComposer(safe), true);
+  assert.equal(shouldRefreshWebQuotaComposer({ ...safe, patchStrategy: "xht-native-quota" }), true);
   for (const override of [
     { patchStrategy: "legacy" },
     { nativeQuotaBlocked: false },
