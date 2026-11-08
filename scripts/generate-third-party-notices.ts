@@ -98,6 +98,14 @@ const output = [
   "=".repeat(80),
   libnotifyLicense,
   "",
+  ...(includeLauncher ? [
+    "=".repeat(80),
+    "Codex Switcher (MIT; account session behavior adapted for the launcher)",
+    "https://github.com/Lampese/codex-switcher",
+    "=".repeat(80),
+    readFileSync(join(root, "launcher", "electron", "CODEX_SWITCHER_LICENSE.txt"), "utf8").trim(),
+    "",
+  ] : []),
   ...sections,
   "",
 ].join("\n");

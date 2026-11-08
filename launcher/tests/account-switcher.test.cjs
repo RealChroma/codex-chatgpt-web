@@ -39,7 +39,7 @@ function account(id, email, tokenSuffix) {
     auth_mode: "chat_g_p_t",
     auth_data: {
       type: "chat_g_p_t",
-      id_token: `id-${tokenSuffix}`,
+      id_token: fakeJwt({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: `workspace-${tokenSuffix}` } }),
       access_token: `access-${tokenSuffix}`,
       refresh_token: `refresh-${tokenSuffix}`,
       account_id: `workspace-${tokenSuffix}`,

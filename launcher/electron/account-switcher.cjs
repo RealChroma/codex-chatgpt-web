@@ -6,6 +6,7 @@ const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { URL, URLSearchParams } = require("node:url");
+const { needsRefresh, refreshOAuthToken, tokenExpiry } = require("./account-oauth.cjs");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const {
   launchOfficialCodexApplication,
@@ -57,7 +58,7 @@ function authModeOf(account) {
   const data = account?.auth_data && typeof account.auth_data === "object" ? account.auth_data : null;
   const mode = stringValue(account?.auth_mode, 32) || stringValue(data?.type, 32);
   if (mode === "api_key" || mode === "api-key") return "api-key";
-  if (mode === "chat_g_p_t" || mode === "chatgpt" || mode === "chat_gpt") return "chatgpt";
+  if (mode === "chat_g_p_t" || mode === "chatgpt" || mode === "chat_gpt" || mode === "chat_g_pt") return "chatgpt";
   return "unknown";
 }
 
@@ -212,14 +213,14 @@ function activeAccountIdFor(store, auth) {
     const matching = store.accounts.find(account => accountIdentity(account) === identity);
     if (matching?.id) return matching.id;
   }
-  const configured = stringValue(store.active_account_id, 512);
-  return configured && store.accounts.some(account => account.id === configured) ? configured : null;
+  const key = stringValue(auth?.OPENAI_API_KEY, 8_192);
+  return key ? store.accounts.find(account => accountAuthData(account)?.key === key)?.id || null : null;
 }
 
 function syncActiveTokens(store, auth) {
   const tokens = auth?.tokens && typeof auth.tokens === "object" ? auth.tokens : null;
   const identity = authIdentity(auth);
-  if (!tokens || !identity) return false;
+  if (!tokens || !identity || !stringValue(tokens.access_token, 1_000_000)) return false;
   const account = store.accounts.find(candidate => accountIdentity(candidate) === identity);
   if (!account) return false;
   const data = account.auth_data && typeof account.auth_data === "object" ? account.auth_data : null;
@@ -698,8 +699,12 @@ async function requestJson(url, accessToken, accountId) {
       redirect: "error",
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`ChatGPT usage request returned HTTP ${response.status}`);
-    return response.json();
+    if (!response.ok) {
+      const error = new Error(`ChatGPT usage request returned HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return await response.json();
   } catch (error) {
     if (error?.name === "AbortError") throw new Error("ChatGPT usage request timed out");
     throw error;
@@ -708,7 +713,7 @@ async function requestJson(url, accessToken, accountId) {
   }
 }
 
-async function fetchAccountUsage(account) {
+async function fetchAccountUsage(account, request = requestJson) {
   const fetchedAt = new Date().toISOString();
   const data = accountAuthData(account);
   if (!data || data.mode !== "chatgpt") {
@@ -719,8 +724,8 @@ async function fetchAccountUsage(account) {
   }
   const accountId = data.accountId || claimsFromToken(data.idToken || data.accessToken).accountId;
   const results = await Promise.allSettled([
-    requestJson(CHATGPT_USAGE_URL, data.accessToken, accountId),
-    requestJson(CHATGPT_PROFILE_USAGE_URL, data.accessToken, accountId),
+    request(CHATGPT_USAGE_URL, data.accessToken, accountId),
+    request(CHATGPT_PROFILE_USAGE_URL, data.accessToken, accountId),
   ]);
   const usageResult = results[0];
   const statsResult = results[1];
@@ -732,7 +737,7 @@ async function fetchAccountUsage(account) {
     : emptyStats(safeErrorMessage(statsResult.reason), fetchedAt);
   if (stats.available) {
     try {
-      const credits = await requestJson(CHATGPT_RESET_CREDITS_URL, data.accessToken, accountId);
+      const credits = await request(CHATGPT_RESET_CREDITS_URL, data.accessToken, accountId);
       const resetCredits = mapResetCreditsPayload(credits);
       stats = {
         ...stats,
@@ -767,7 +772,7 @@ async function fetchAccountUsageSnapshot(account) {
 
 function safeErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /HTTP \d+/.test(message) || /timed out|unavailable/i.test(message)
+  return /HTTP \d+/.test(message) || /timed out|unavailable|sign in to this account again/i.test(message)
     ? message.slice(0, 512)
     : "ChatGPT usage refresh failed";
 }
@@ -918,6 +923,7 @@ function createAccountSwitcher({
   beforeOfficialRestart = async () => null,
   afterOfficialRestart = async ({ identity }) => launchApp(identity),
   abortOfficialRestart = async () => {},
+  refreshTokens = refreshOAuthToken,
 } = {}) {
   const resolvedStorePath = path.resolve(accountStorePath);
   const resolvedActivityPath = path.resolve(activityPath);
@@ -953,27 +959,98 @@ function createAccountSwitcher({
     };
   }
 
+  // Called only while the authentication queue is held.
+  async function freshAccount(accountId, force = false) {
+    let state = readAccountStore(resolvedStorePath);
+    if (!state.valid) throw new Error("The Codex Switcher account store could not be read");
+    const auth = readAuthFile(authPath);
+    if (syncActiveTokens(state.value, auth)) saveAccountStore(resolvedStorePath, state.value);
+    const account = state.value.accounts.find(candidate => candidate.id === accountId);
+    if (!account) throw new Error("Selected Codex account was not found");
+    const data = accountAuthData(account);
+    if (!data || data.mode !== "chatgpt" || (!force && !needsRefresh(data))) return account;
+    const active = activeAccountIdFor(state.value, auth) === accountId;
+    if (active) {
+      // Never compete with the installed application's refresh-token rotation.
+      const identity = await resolveIdentity();
+      if ((await listProcesses(identity)).length) return account;
+    }
+    const next = await refreshTokens(data.refreshToken);
+    const idToken = stringValue(next.id_token, 1_000_000);
+    const idValid = tokenExpiry(idToken || data.idToken) > Date.now() / 1000 + 60;
+    const nextIdentity = claimsFromToken(idToken).accountId;
+    const identityMismatch = nextIdentity && accountIdentity(account) && nextIdentity !== accountIdentity(account);
+    // Persist rotated tokens before rejecting a missing/expired ID token.
+    state = readAccountStore(resolvedStorePath);
+    if (!state.valid) throw new Error("The Codex Switcher account store could not be read");
+    const latest = state.value.accounts.find(candidate => candidate.id === accountId);
+    const latestData = latest?.auth_data?.tokens || latest?.auth_data;
+    if (!latestData) throw new Error("Selected Codex account was not found");
+    if (accountAuthData(latest)?.refreshToken !== data.refreshToken) {
+      throw new Error("Account credentials changed during refresh; retry the operation");
+    }
+    if (identityMismatch) throw new Error("OAuth refresh returned a different account; sign in again");
+    latestData.access_token = stringValue(next.access_token, 1_000_000) || data.accessToken;
+    latestData.refresh_token = stringValue(next.refresh_token, 1_000_000) || data.refreshToken;
+    if (idToken && idValid) latestData.id_token = idToken;
+    const claims = claimsFromToken(latestData.id_token);
+    if (claims.email) latest.email = claims.email;
+    if (claims.plan) latest.plan_type = claims.plan;
+    if (claims.subscriptionExpiresAt) latest.subscription_expires_at = claims.subscriptionExpiresAt;
+    saveAccountStore(resolvedStorePath, state.value);
+    if (!idValid) throw new Error("OAuth refresh did not return a fresh ID token; sign in to this account again");
+    // Check live identity again before updating the active auth file.
+    if (active && activeAccountIdFor(state.value, readAuthFile(authPath)) === accountId) {
+      writePrivateFileAtomic(authPath, `${JSON.stringify(authJsonForAccount(latest), null, 2)}\n`);
+    }
+    return latest;
+  }
+
   async function refreshUsageNow() {
     if (platform !== "win32") return;
     if (usageRefreshPromise) return usageRefreshPromise;
-    usageRefreshPromise = (async () => {
+    usageRefreshPromise = enqueue(async () => {
       const storeState = readAccountStore(resolvedStorePath);
       if (!storeState.valid || storeState.value.accounts.length === 0) return;
       const store = storeState.value;
       const auth = readAuthFile(authPath);
       if (syncActiveTokens(store, auth)) saveAccountStore(resolvedStorePath, store);
       const records = loadUsageCache(resolvedUsageCachePath);
-      const refreshed = await mapWithConcurrency(store.accounts, 3, async account => {
-        const record = await fetchAccountUsage(account).catch(error => ({
+      // Store mutations and token rotations share the same queue as explicit switches.
+      const refreshed = [];
+      for (const saved of store.accounts) {
+        let account;
+        try { account = await freshAccount(saved.id); }
+        catch (error) {
+          const at = new Date().toISOString();
+          records[saved.id] = { usage: emptyUsage(safeErrorMessage(error), at), stats: emptyStats(safeErrorMessage(error), at) };
+          refreshed.push(records[saved.id]);
+          continue;
+        }
+        let refresh = null;
+        const request = async (url) => {
+          const send = candidate => {
+            const data = accountAuthData(candidate);
+            return requestJson(url, data.accessToken, accountIdentity(candidate));
+          };
+          try { return await send(account); }
+          catch (error) {
+            if (error.status !== 401) throw error;
+            // Rate limits, profiles and reset credits share a single refresh attempt.
+            refresh ||= freshAccount(saved.id, true);
+            return send(await refresh);
+          }
+        };
+        const record = await fetchAccountUsage(account, request).catch(error => ({
           usage: emptyUsage(safeErrorMessage(error), new Date().toISOString()),
           stats: emptyStats(safeErrorMessage(error), new Date().toISOString()),
         }));
         records[account.id] = record;
-        return record;
-      });
+        refreshed.push(record);
+      }
       if (refreshed.length > 0) saveUsageCache(resolvedUsageCachePath, records);
       logger.info("accounts.usage_refreshed", { accountCount: refreshed.length });
-    })().finally(() => {
+    }).finally(() => {
       usageRefreshPromise = null;
     });
     return usageRefreshPromise;
@@ -1004,9 +1081,6 @@ function createAccountSwitcher({
     ));
     if (duplicate) throw new Error("This Codex account is already added");
     store.accounts.push(account);
-    if (!stringValue(store.active_account_id, 512)) {
-      store.active_account_id = store.accounts[0]?.id || account.id;
-    }
     return account;
   }
 
@@ -1251,7 +1325,9 @@ function createAccountSwitcher({
       if (!target) throw new Error("Selected Codex account was not found");
       const currentAuth = readAuthFile(authPath);
       if (activeAccountIdFor(store, currentAuth) === requestedId) return snapshot();
-      const targetAuth = authJsonForAccount(target);
+      // Validate and refresh the destination before stopping the user's running app.
+      const fresh = await freshAccount(requestedId);
+      const targetAuth = authJsonForAccount(fresh);
       const identity = await resolveIdentity();
       const processes = await listProcesses(identity);
       const wasRunning = processes.length > 0;
@@ -1261,11 +1337,14 @@ function createAccountSwitcher({
         if (wasRunning) await terminateProcesses(identity, processes, { listProcesses, platform });
 
         const currentAuth = readAuthFile(authPath);
-        if (syncActiveTokens(store, currentAuth)) saveAccountStore(resolvedStorePath, store);
+        const state = readAccountStore(resolvedStorePath);
+        if (!state.valid) throw new Error("The Codex Switcher account store could not be read");
+        const latest = state.value;
+        syncActiveTokens(latest, currentAuth);
+        latest.active_account_id = requestedId;
+        latest.accounts.find(account => account.id === requestedId).last_used_at = new Date().toISOString();
         writePrivateFileAtomic(authPath, `${JSON.stringify(targetAuth, null, 2)}\n`);
-        store.active_account_id = requestedId;
-        target.last_used_at = new Date().toISOString();
-        saveAccountStore(resolvedStorePath, store);
+        saveAccountStore(resolvedStorePath, latest);
         recordActivity(resolvedActivityPath, requestedId, "switch");
 
         if (wasRunning) await afterOfficialRestart({ identity, restartContext });
