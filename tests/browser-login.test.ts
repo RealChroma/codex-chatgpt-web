@@ -268,6 +268,19 @@ test("macOS quit request stops retrying once ownership of the process ends", asy
   }
 });
 
+test("macOS quit preserves the ownership reason when the process check is aborted in flight", async () => {
+  const ownership = new AbortController();
+  const reason = new Error("Chrome exited");
+  const pending = quitMacApplication(123, process.execPath, ownership.signal, 10_000, (_script, signal) =>
+    new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        reject(new DOMException("The operation was aborted", "AbortError"));
+      }, { once: true });
+    }));
+  ownership.abort(reason);
+  expect(await pending.catch(error => error)).toBe(reason);
+});
+
 test("passkey login ends a pending quit request when the sign-in deadline expires", async () => {
   if (process.platform !== "darwin") return;
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-passkey-deadline-"));

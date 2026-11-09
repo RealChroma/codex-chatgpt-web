@@ -91,11 +91,18 @@ async function waitForBrowserExit(browser: ChildProcess, timeoutMs: number): Pro
 
 const execFileAsync = promisify(execFile);
 
+async function requestMacApplicationQuit(script: string, signal: AbortSignal): Promise<string> {
+  const { stdout } = await execFileAsync("osascript", ["-l", "JavaScript", "-e", script],
+    { timeout: SYSTEM_LOGIN_STOP_TIMEOUT_MS, signal });
+  return stdout.trim();
+}
+
 export async function quitMacApplication(
   pid: number,
   executablePath: string,
   signal: AbortSignal,
   registrationTimeoutMs = SYSTEM_LOGIN_REGISTRATION_TIMEOUT_MS,
+  requestQuit = requestMacApplicationQuit,
 ): Promise<void> {
   if (!Number.isInteger(pid) || pid < 1) throw new Error(`Invalid dedicated Chrome process id: ${pid}`);
   const script = `ObjC.import("AppKit");
@@ -112,9 +119,14 @@ app.isNil() ? (parentOf() === "${process.pid}" ? "missing" : "foreign")
   let result: string;
   for (;;) {
     signal.throwIfAborted();
-    const { stdout } = await execFileAsync("osascript", ["-l", "JavaScript", "-e", script],
-      { timeout: SYSTEM_LOGIN_STOP_TIMEOUT_MS, signal });
-    result = stdout.trim();
+    try {
+      result = await requestQuit(script, signal);
+    } catch (error) {
+      // execFile wraps cancellation in an AbortError; use the ownership reason.
+      signal.throwIfAborted();
+      throw error;
+    }
+    signal.throwIfAborted();
     if (result !== "missing" || Date.now() >= deadline) break;
     await new Promise<void>((resolve, reject) => {
       const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
